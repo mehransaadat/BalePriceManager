@@ -12,8 +12,8 @@ import sqlite3
 import logging
 import requests
 
-BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "your bot token")
-ADMIN_CHAT_ID = int(os.environ.get("BALE_ADMIN_CHAT_ID", "put your chat_id"))
+BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "1258122671:KfFt7JNbCDAE2gIvgNSBWPcMT-i-kinpZAg")
+ADMIN_CHAT_ID = int(os.environ.get("BALE_ADMIN_CHAT_ID", "1804507729"))
 
 API_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 FILE_URL = f"https://tapi.bale.ai/file/bot{BOT_TOKEN}"
@@ -33,6 +33,20 @@ def db_init():
             phone TEXT,
             first_name TEXT,
             joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # پیام‌هایی که هنوز ارسال نشده‌اند (چه به‌خاطر خطای شبکه، چه هر دلیل دیگری)
+    # اینجا نگه داشته می‌شوند تا چیزی گم نشود؛ حتی اگر ربات ری‌استارت شود،
+    # این صف روی دیسک باقی می‌ماند و در اجرای بعدی دوباره تلاش می‌شود.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            parse_mode TEXT,
+            attempts INTEGER DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -67,9 +81,25 @@ def save_user(conn, chat_id, phone=None, first_name=None):
 # ---------- توابع کمکی API بله ----------
 
 def api(method, **params):
-    r = requests.post(f"{API_URL}/{method}", data=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    """درخواست به API بله را می‌فرستد و در صورت خطای موقت شبکه (مثل قطع SSL)
+    چند بار با فاصلهٔ زمانی افزایشی دوباره تلاش می‌کند"""
+    max_attempts = 3
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(f"{API_URL}/{method}", data=params, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.SSLError,
+                requests.exceptions.Timeout) as e:
+            last_error = e
+            if attempt < max_attempts:
+                wait = 1.5 * attempt  # ۱.۵، ۳ ثانیه
+                log.warning("خطای موقت شبکه در %s (تلاش %s/%s): %s — %s ثانیه صبر و تلاش دوباره",
+                            method, attempt, max_attempts, e, wait)
+                time.sleep(wait)
+    raise last_error
 
 
 def send_message(chat_id, text, reply_markup=None, parse_mode=None):
@@ -145,6 +175,50 @@ def build_table(rows):
     return "```\n" + table + "\n```"
 
 
+# ---------- صف پیام‌های ارسال‌نشده (outbox) ----------
+
+def enqueue(conn, chat_id, text, parse_mode=None):
+    """پیام را قبل از هر تلاشی روی دیسک ذخیره می‌کند تا هرگز گم نشود"""
+    cur = conn.execute(
+        "INSERT INTO outbox (chat_id, text, parse_mode) VALUES (?,?,?)",
+        (chat_id, text, parse_mode),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def flush_outbox(conn, max_per_call=200):
+    """تلاش می‌کند پیام‌های موجود در صف را بفرستد؛ هر پیامی که موفق ارسال شود
+    از صف حذف می‌شود، و هر پیامی که هنوز ناموفق باشد در صف می‌ماند تا دفعهٔ بعد.
+    این تابع هم بعد از هر broadcast و هم به‌صورت دوره‌ای در حلقهٔ اصلی صدا زده می‌شود،
+    پس اگر شبکه قطع باشد، پیام گم نمی‌شود و به‌محض وصل شدن دوباره شبکه ارسال خواهد شد."""
+    rows = conn.execute(
+        "SELECT id, chat_id, text, parse_mode FROM outbox ORDER BY id LIMIT ?",
+        (max_per_call,),
+    ).fetchall()
+
+    sent, still_pending = 0, 0
+    for row_id, chat_id, text, parse_mode in rows:
+        try:
+            send_message(chat_id, text, parse_mode=parse_mode)
+            conn.execute("DELETE FROM outbox WHERE id=?", (row_id,))
+            conn.commit()
+            sent += 1
+        except Exception as e:
+            conn.execute(
+                "UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?",
+                (str(e), row_id),
+            )
+            conn.commit()
+            still_pending += 1
+            log.warning("ارسال پیام صف (id=%s) به %s هنوز ناموفق است: %s", row_id, chat_id, e)
+        time.sleep(0.4)  # رعایت محدودیت نرخ ارسال بله (حداکثر ۲ پیام در ثانیه)
+
+    if sent or still_pending:
+        log.info("outbox: %s پیام ارسال شد، %s پیام هنوز در صف مانده", sent, still_pending)
+    return sent, still_pending
+
+
 # ---------- ارسال گروهی ----------
 
 def broadcast(conn, text, only_phones=None):
@@ -159,17 +233,13 @@ def broadcast(conn, text, only_phones=None):
         targets = all_users
         missing = set()
 
-    sent, failed = 0, 0
+    # همهٔ پیام‌ها را اول در صف روی دیسک ذخیره می‌کنیم؛ این‌طوری حتی اگر
+    # درست همین‌جا برق برود یا برنامه کرش کند، هیچ پیامی گم نمی‌شود.
     for chat_id, _ in targets:
-        try:
-            send_message(chat_id, text, parse_mode="Markdown")
-            sent += 1
-        except Exception as e:
-            log.warning("ارسال به %s ناموفق بود: %s", chat_id, e)
-            failed += 1
-        time.sleep(0.4)  # رعایت محدودیت نرخ ارسال بله (حداکثر ۲ پیام در ثانیه)
+        enqueue(conn, chat_id, text, parse_mode="Markdown")
 
-    return sent, failed, missing
+    sent, queued = flush_outbox(conn)
+    return sent, queued, missing
 
 
 # ---------- پردازش پیام‌های ورودی ----------
@@ -214,6 +284,11 @@ def handle_update(conn, update):
         send_message(chat_id, f"تعداد کاربران ثبت‌شده: {n}")
         return
 
+    if text == "/queue":
+        n = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+        send_message(chat_id, f"تعداد پیام‌های در صف انتظار ارسال: {n}")
+        return
+
     if "document" in message:
         doc = message["document"]
         caption = (message.get("caption") or "").strip()
@@ -227,15 +302,17 @@ def handle_update(conn, update):
 
             if caption:
                 phones = [p.strip() for p in re.split(r"[,\n]+", caption) if p.strip()]
-                sent, failed, missing = broadcast(conn, table_msg, only_phones=phones)
+                sent, queued, missing = broadcast(conn, table_msg, only_phones=phones)
             else:
-                sent, failed, missing = broadcast(conn, table_msg)
+                sent, queued, missing = broadcast(conn, table_msg)
 
-            report = f"ارسال شد ✅\nتعداد موفق: {sent}\nتعداد ناموفق: {failed}"
+            report = f"ارسال شد ✅\nتعداد موفق: {sent}"
+            if queued:
+                report += (f"\nتعداد در صف (به‌خاطر مشکل شبکه، به‌محض وصل شدن دوباره تلاش می‌شود): {queued}")
             if missing:
                 report += ("\n\nاین شماره‌ها هنوز ربات را استارت نکرده‌اند و پیام دریافت نکردند:\n"
                            + "\n".join(sorted(missing)))
-            send_message(chat_id, report)
+            enqueue(conn, chat_id, report)
         finally:
             if os.path.exists(local_path):
                 os.remove(local_path)
@@ -268,6 +345,14 @@ def main():
                 handle_update(conn, update)
             except Exception as e:
                 log.exception("خطا در پردازش پیام: %s", e)
+
+        # هر دور از حلقه (چه پیام جدیدی رسیده باشد چه نه) یک‌بار صف را
+        # خالی کردن امتحان می‌کنیم؛ این‌طوری به‌محض وصل شدن دوباره شبکه،
+        # پیام‌های معطل‌مانده بدون نیاز به پیام جدید ارسال می‌شوند.
+        try:
+            flush_outbox(conn)
+        except Exception as e:
+            log.warning("خطا هنگام خالی کردن صف: %s", e)
 
 
 if __name__ == "__main__":
