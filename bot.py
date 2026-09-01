@@ -166,9 +166,13 @@ def parse_price_lines(raw_text):
 def build_table(rows):
     if not rows:
         return "```\nلیست قیمتی خالی است.\n```"
+    idx_w = len(str(len(rows)))
     name_w = max(len(n) for n, _ in rows)
     price_w = max(len(p) for _, p in rows)
-    lines = [f"{name.ljust(name_w)}  {price.rjust(price_w)}" for name, price in rows]
+    lines = [
+        f"{str(i).rjust(idx_w)}. {name.ljust(name_w)}  {price.rjust(price_w)}"
+        for i, (name, price) in enumerate(rows, start=1)
+    ]
     table = "\n".join(lines)
     # داخل بلاک کد (```) قرار می‌گیرد تا فونت ثابت (monospace) باشد
     # و فاصله‌ها/ترتیب ستون‌ها در گوشی کاربر به‌هم نریزد
@@ -316,6 +320,19 @@ def handle_update(conn, update):
         finally:
             if os.path.exists(local_path):
                 os.remove(local_path)
+        return
+
+    # از این‌جا به بعد: پیام متنی معمولی از ادمین (نه فایل، نه یکی از دستورات بالا)
+    # یعنی خود ادمین مستقیماً لیست قیمت را خط‌به‌خط تایپ کرده است
+    if text.strip():
+        rows = parse_price_lines(text)
+        if rows:
+            table_msg = build_table(rows)
+            sent, queued, missing = broadcast(conn, table_msg)
+            report = f"ارسال شد ✅\nتعداد موفق: {sent}"
+            if queued:
+                report += (f"\nتعداد در صف (به‌خاطر مشکل شبکه، به‌محض وصل شدن دوباره تلاش می‌شود): {queued}")
+            enqueue(conn, chat_id, report)
         return
 
 
