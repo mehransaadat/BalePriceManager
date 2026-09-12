@@ -26,6 +26,18 @@ DB_PATH = "users.db"
 OUTPUT_DIR = "sent_price_lists"  # فایل‌های نهایی (اکسل) قبل از ارسال اینجا ذخیره می‌شوند
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
+# ---------- تنظیمات سرویس «سفیر» بله (ارسال پیام به شماره، حتی برای کسانی که ربات را استارت نکرده‌اند) ----------
+# TODO: به‌محض دریافت این دو مقدار از پنل کسب‌وکار بله، این‌جا یا در متغیرهای محیطی پر کنید.
+# تا وقتی خالی باشند، دکمهٔ «تلاش دوباره از طریق سفیر» در ربات غیرفعال می‌ماند و بقیهٔ ربات
+# دقیقاً مثل قبل کار می‌کند؛ یعنی همین الان می‌توانید کد را اجرا کنید.
+SAFIR_API_ACCESS_KEY = os.environ.get("SAFIR_API_ACCESS_KEY", "")
+SAFIR_BOT_ID = os.environ.get("SAFIR_BOT_ID", "")
+SAFIR_API_URL = "https://safir.bale.ai/api/v3/send_message"
+
+
+def safir_configured():
+    return bool(SAFIR_API_ACCESS_KEY and SAFIR_BOT_ID)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("price-bot")
 
@@ -61,8 +73,58 @@ def db_init():
     cols = [row[1] for row in conn.execute("PRAGMA table_info(outbox)").fetchall()]
     if "file_path" not in cols:
         conn.execute("ALTER TABLE outbox ADD COLUMN file_path TEXT")
+
+    # لیست اصلی شماره مشتریان که ادمین از طریق دکمهٔ اکسل آپلود می‌کند (جدا از
+    # جدول users که فقط کسانی‌اند که خودشان ربات را استارت کرده‌اند)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS customer_numbers (
+            phone TEXT PRIMARY KEY,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # لاگ دائمی هر ارسال (برخلاف outbox که بعد از ارسال موفق پاک می‌شود)، برای
+    # گزارش «به چه شماره‌هایی در چه تاریخی ارسال شد / نشد»
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS send_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_date TEXT NOT NULL,
+            file_name TEXT,
+            phone TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # وضعیت فعلی ادمین در گفتگو (مثلاً منتظر آپلود لیست شماره‌ها یا فایل قیمت است)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_state (
+            admin_chat_id INTEGER PRIMARY KEY,
+            state TEXT
+        )
+    """)
+
     conn.commit()
     return conn
+
+
+# ---------- وضعیت ادمین (کدام دکمه را زده و منتظر چه فایلی است) ----------
+
+def set_admin_state(conn, admin_chat_id, state):
+    conn.execute(
+        "INSERT INTO admin_state (admin_chat_id, state) VALUES (?, ?) "
+        "ON CONFLICT(admin_chat_id) DO UPDATE SET state=excluded.state",
+        (admin_chat_id, state),
+    )
+    conn.commit()
+
+
+def get_admin_state(conn, admin_chat_id):
+    row = conn.execute(
+        "SELECT state FROM admin_state WHERE admin_chat_id=?", (admin_chat_id,)
+    ).fetchone()
+    return row[0] if row else None
 
 
 def normalize_phone(phone: str) -> str:
@@ -77,6 +139,32 @@ def normalize_phone(phone: str) -> str:
     elif digits.startswith("9") and len(digits) == 10:
         digits = "+98" + digits
     return digits
+
+
+IRAN_PHONE_RE = re.compile(r"^\+989\d{9}$")
+
+
+def save_customer_numbers(conn, phones):
+    """لیست کامل شماره مشتریان را جایگزین لیست قبلی می‌کند (چون فایل جدید آپلودشده
+    قرار است «لیست به‌روز» باشد، نه اضافه‌شدن به لیست قدیمی). هر چیزی که بعد از
+    نرمال‌سازی به شکل یک شمارهٔ موبایل ایرانی معتبر (+98912...) درنیاید، نادیده
+    گرفته می‌شود (مثلاً اگر فایل ستون ردیف یا عدد دیگری هم داشته باشد)."""
+    normalized = sorted({
+        normalize_phone(p) for p in phones
+        if IRAN_PHONE_RE.match(normalize_phone(p) or "")
+    })
+    conn.execute("DELETE FROM customer_numbers")
+    conn.executemany(
+        "INSERT INTO customer_numbers (phone) VALUES (?)",
+        [(p,) for p in normalized],
+    )
+    conn.commit()
+    return normalized
+
+
+def get_customer_numbers(conn):
+    rows = conn.execute("SELECT phone FROM customer_numbers ORDER BY phone").fetchall()
+    return [r[0] for r in rows]
 
 
 def save_user(conn, chat_id, phone=None, first_name=None):
@@ -156,6 +244,28 @@ CONTACT_KEYBOARD = {
     "resize_keyboard": True,
     "one_time_keyboard": True,
 }
+
+# منوی دکمه‌ای ادمین؛ با دستور /panel نمایش داده می‌شود
+ADMIN_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "📋 آپلود لیست شماره مشتریان", "callback_data": "await_phone_list"}],
+        [{"text": "💰 آپلود فایل قیمت و موجودی", "callback_data": "await_price_file"}],
+        [{"text": "📊 گزارش آخرین ارسال", "callback_data": "report_last"}],
+        [{"text": "🔁 تلاش دوباره برای جامانده‌ها (سفیر)", "callback_data": "retry_missing"}],
+    ]
+}
+
+
+def answer_callback_query(callback_query_id, text=None):
+    """به بله اطلاع می‌دهد که کلیک روی دکمه پردازش شد (تا چرخش لودینگ دکمه قطع شود).
+    اگر بله این متد را نداشته باشد یا خطا بدهد، فقط لاگ می‌شود و ربات متوقف نمی‌شود."""
+    try:
+        params = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text
+        api("answerCallbackQuery", **params)
+    except Exception as e:
+        log.warning("answerCallbackQuery ناموفق بود (مهم نیست، ادامه می‌دهیم): %s", e)
 
 
 def download_file(file_id, dest_path):
@@ -259,6 +369,38 @@ def parse_price_file(local_path, original_filename=""):
     # هر فایل دیگری (txt، csv، tsv، بدون پسوند و ...) به‌عنوان متن ساده خوانده می‌شود
     raw_text = read_text_any_encoding(local_path)
     return parse_price_lines(raw_text)
+
+
+def parse_phone_list_file(local_path, original_filename=""):
+    """فایل لیست شماره مشتریان (اکسل یا متنی) را می‌خواند و یک لیست ساده از رشته‌های
+    خام شماره برمی‌گرداند (نرمال‌سازی نهایی توسط normalize_phone در save_customer_numbers
+    انجام می‌شود، پس اینجا لازم نیست فرمت خاصی رعایت شود)"""
+    ext = os.path.splitext(original_filename or local_path)[1].lower()
+    phones = []
+    if ext in (".xlsx", ".xlsm"):
+        wb = load_workbook(local_path, data_only=True)
+        ws = wb.active
+        for excel_row in ws.iter_rows(values_only=True):
+            for cell in excel_row:
+                if cell is None:
+                    continue
+                text = str(cell).strip()
+                if not text or _looks_like_header([text]):
+                    continue
+                phones.append(text)
+    elif ext == ".xls":
+        raise ValueError(
+            "فرمت قدیمی xls پشتیبانی نمی‌شود. لطفاً فایل را با فرمت xlsx ذخیره کنید "
+            "یا آن را به‌صورت فایل متنی (txt / csv) بفرستید."
+        )
+    else:
+        raw_text = read_text_any_encoding(local_path)
+        for line in raw_text.splitlines():
+            for part in re.split(r"[,\t;]+|\s{2,}", line.strip()):
+                part = part.strip()
+                if part:
+                    phones.append(part)
+    return phones
 
 
 # ---------- ساخت فایل خروجی (اکسل) با نام تاریخ‌دار شمسی ----------
@@ -399,23 +541,131 @@ def broadcast(conn, text="", file_path=None, only_phones=None, parse_mode=None):
     return sent, queued, missing
 
 
+# ---------- لاگ دائمی ارسال‌ها (برای گزارش) ----------
+
+def log_send(conn, batch_date, file_name, phone, status, error=None):
+    conn.execute(
+        "INSERT INTO send_log (batch_date, file_name, phone, status, error) VALUES (?,?,?,?,?)",
+        (batch_date, file_name, phone, status, error),
+    )
+    conn.commit()
+
+
+def log_batch_result(conn, batch_date, file_name, conn_users, target_phones, missing_phones):
+    """برای هر شماره در لیست هدف، وضعیت نهایی را در send_log ثبت می‌کند:
+    'sent_or_queued' یعنی پیام به‌صف فرستادن رسید (چه همان لحظه ارسال شود چه بعداً
+    توسط outbox دوباره تلاش شود)، 'not_started' یعنی آن شماره اصلاً ربات را استارت
+    نکرده و بله اجازهٔ ارسال مستقیم به آن را نمی‌دهد."""
+    users_by_phone = {ph: cid for cid, ph in conn_users}
+    for phone in target_phones:
+        if phone in missing_phones:
+            log_send(conn, batch_date, file_name, phone, "not_started")
+        elif phone in users_by_phone:
+            log_send(conn, batch_date, file_name, phone, "sent_or_queued")
+
+
+def last_batch_date(conn):
+    row = conn.execute(
+        "SELECT batch_date FROM send_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return row[0] if row else None
+
+
+def build_report(conn, batch_date=None):
+    """گزارش یک تاریخ مشخص (یا آخرین تاریخ اگر داده نشود) را می‌سازد: تعداد هر
+    وضعیت + لیست شماره‌هایی که ارسال نشده‌اند (not_started)، برای این‌که ادمین
+    بداند برای چه کسانی باید دوباره تلاش کند (مثلاً از طریق سفیر)."""
+    if batch_date is None:
+        batch_date = last_batch_date(conn)
+    if batch_date is None:
+        return "هنوز هیچ ارسالی ثبت نشده است.", []
+
+    rows = conn.execute(
+        "SELECT phone, status FROM send_log WHERE batch_date=? ORDER BY phone",
+        (batch_date,),
+    ).fetchall()
+    if not rows:
+        return f"برای تاریخ «{batch_date}» هیچ گزارشی پیدا نشد.", []
+
+    sent = [p for p, s in rows if s in ("sent_or_queued", "sent_via_safir")]
+    not_started = [p for p, s in rows if s == "not_started"]
+    failed_safir = [p for p, s in rows if s == "failed_via_safir"]
+
+    text = (
+        f"📊 گزارش ارسال — {batch_date}\n"
+        f"تعداد کل شماره‌های هدف: {len(rows)}\n"
+        f"✅ ارسال‌شده (از طریق ربات بله): {len(sent)}\n"
+        f"❌ استارت‌نکرده (پیام دریافت نکردند): {len(not_started)}"
+    )
+    if failed_safir:
+        text += f"\n⚠️ تلاش ناموفق از طریق سفیر: {len(failed_safir)}"
+    if not_started:
+        preview = "\n".join(not_started[:30])
+        text += f"\n\nشماره‌های استارت‌نکرده:\n{preview}"
+        if len(not_started) > 30:
+            text += f"\n… و {len(not_started) - 30} شمارهٔ دیگر (فایل کامل ضمیمه می‌شود)."
+    return text, not_started
+
+
+# ---------- سرویس سفیر بله (ارسال مستقیم به شماره، بدون نیاز به استارت قبلی) ----------
+
+def send_via_safir(phone_98_format, text):
+    """یک پیام متنی را از طریق سرویس سفیر بله مستقیماً به یک شماره می‌فرستد.
+    phone_98_format باید به‌شکل 98XXXXXXXXXX باشد (بدون + و بدون خط تیره).
+    این تابع فقط وقتی SAFIR_API_ACCESS_KEY و SAFIR_BOT_ID پر شده باشند کار می‌کند."""
+    if not safir_configured():
+        raise RuntimeError("اطلاعات سرویس سفیر (SAFIR_API_ACCESS_KEY / SAFIR_BOT_ID) هنوز تنظیم نشده است.")
+    payload = {
+        "request_id": f"price-{int(time.time() * 1000)}-{phone_98_format}",
+        "bot_id": int(SAFIR_BOT_ID),
+        "phone_number": phone_98_format,
+        "message_data": {"message": {"text": text}},
+    }
+    headers = {"api-access-key": SAFIR_API_ACCESS_KEY, "Content-Type": "application/json"}
+    r = requests.post(SAFIR_API_URL, json=payload, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def to_safir_phone(normalized_phone):
+    """+98XXXXXXXXXX (فرمت داخلی ربات) را به 98XXXXXXXXXX (فرمت موردنیاز سفیر) تبدیل می‌کند"""
+    return normalized_phone.lstrip("+")
+
+
 # ---------- پردازش پیام‌های ورودی ----------
 
 def handle_price_rows(conn, admin_chat_id, rows, only_phones=None):
     """از یک لیست (نام, قیمت) فایل اکسل تاریخ‌دار می‌سازد، همراه با پیام تاریخ/ساعت
-    برای کاربران broadcast می‌کند و گزارش را برای ادمین در صف می‌گذارد"""
+    برای کاربران broadcast می‌کند، نتیجه را در send_log ثبت می‌کند (برای گزارش)،
+    و خلاصه را برای ادمین در صف می‌گذارد"""
     if not rows:
         enqueue(conn, admin_chat_id, "هیچ ردیف قیمتی در ورودی پیدا نشد؛ چیزی ارسال نشد.")
         return
 
-    jnow = jalali_now()  # یک‌بار محاسبه می‌شود تا نام فایل و پیام همراه، دقیقاً هم‌تاریخ باشند
+    jnow = jalali_now()  # یک‌بار محاسبه می‌شود تا نام فایل، پیام همراه، و گزارش دقیقاً هم‌تاریخ باشند
     out_path = build_price_file(rows, jnow)
     caption = price_list_caption(jnow)
+
+    # اگر ادمین لیست شماره خاصی در caption نداده باشد و لیست اصلی مشتریان (از دکمهٔ
+    # «آپلود لیست شماره مشتریان») پر باشد، هدف پیش‌فرض همان لیست است؛ در غیر این
+    # صورت رفتار قبلی حفظ می‌شود (همهٔ کاربران ثبت‌شده در ربات)
+    if only_phones is None:
+        customer_list = get_customer_numbers(conn)
+        if customer_list:
+            only_phones = customer_list
+
     sent, queued, missing = broadcast(conn, text=caption, file_path=out_path, only_phones=only_phones)
+
+    batch_date = jnow.strftime("%Y-%m-%d %H:%M")
+    file_name = os.path.basename(out_path)
+    all_users = conn.execute("SELECT chat_id, phone FROM users").fetchall()
+    target_phones = only_phones if only_phones is not None else [ph for _, ph in all_users if ph]
+    log_batch_result(conn, batch_date, file_name, all_users, target_phones, missing)
 
     report = (
         f"ارسال شد ✅\n"
-        f"نام فایل ارسالی: {os.path.basename(out_path)}\n"
+        f"تاریخ/دستهٔ ارسال: {batch_date}\n"
+        f"نام فایل ارسالی: {file_name}\n"
         f"تعداد ردیف: {len(rows)}\n"
         f"تعداد موفق: {sent}"
     )
@@ -424,10 +674,112 @@ def handle_price_rows(conn, admin_chat_id, rows, only_phones=None):
     if missing:
         report += ("\n\nاین شماره‌ها هنوز ربات را استارت نکرده‌اند و پیام دریافت نکردند:\n"
                    + "\n".join(sorted(missing)))
+        report += "\n\nبرای گزارش کامل و امکان تلاش دوباره، از دکمهٔ «📊 گزارش آخرین ارسال» استفاده کنید."
     enqueue(conn, admin_chat_id, report)
 
 
+def find_batch_date_for_day(conn, day_str):
+    """اگر ادمین فقط تاریخ (بدون ساعت) بدهد، آخرین دستهٔ ارسال همان روز را پیدا می‌کند"""
+    row = conn.execute(
+        "SELECT batch_date FROM send_log WHERE batch_date LIKE ? ORDER BY id DESC LIMIT 1",
+        (day_str + "%",),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def send_report(conn, chat_id, batch_date=None):
+    text, not_started = build_report(conn, batch_date)
+    enqueue(conn, chat_id, text)
+    if len(not_started) > 30:
+        # لیست کامل شماره‌های ارسال‌نشده را به‌صورت فایل اکسل هم می‌فرستیم چون در متن جا نمی‌شود
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "استارت‌نکرده‌ها"
+        ws.append(["شماره"])
+        for p in not_started:
+            ws.append([p])
+        path = os.path.join(OUTPUT_DIR, f"شماره‌های-استارت‌نکرده-{jalali_now().strftime('%Y-%m-%d_%H-%M')}.xlsx")
+        wb.save(path)
+        enqueue(conn, chat_id, "", file_path=path)
+
+
+def handle_retry_missing(conn, chat_id):
+    if not safir_configured():
+        enqueue(
+            conn, chat_id,
+            "سرویس سفیر هنوز متصل نشده. وقتی SAFIR_API_ACCESS_KEY و SAFIR_BOT_ID را از پنل "
+            "کسب‌وکار بله گرفتید، آن‌ها را به‌عنوان متغیر محیطی تنظیم کنید و ربات را دوباره اجرا کنید.",
+        )
+        return
+
+    batch_date = last_batch_date(conn)
+    if not batch_date:
+        enqueue(conn, chat_id, "هنوز هیچ ارسالی ثبت نشده که بخواهیم برایش دوباره تلاش کنیم.")
+        return
+
+    rows = conn.execute(
+        "SELECT phone FROM send_log WHERE batch_date=? AND status='not_started'",
+        (batch_date,),
+    ).fetchall()
+    phones = [r[0] for r in rows]
+    if not phones:
+        enqueue(conn, chat_id, f"برای دستهٔ {batch_date} شماره‌ی جامانده‌ای ثبت نشده.")
+        return
+
+    nudge_text = (
+        "📋 لیست قیمت جدید آماده است.\n"
+        "لطفاً برای دریافت فایل کامل قیمت و موجودی، به ربات ما پیام /start بزنید."
+    )
+    ok, failed = 0, 0
+    for phone in phones:
+        try:
+            send_via_safir(to_safir_phone(phone), nudge_text)
+            log_send(conn, batch_date, "retry-via-safir", phone, "sent_via_safir")
+            ok += 1
+        except Exception as e:
+            log_send(conn, batch_date, "retry-via-safir", phone, "failed_via_safir", str(e))
+            failed += 1
+        time.sleep(0.3)
+
+    enqueue(
+        conn, chat_id,
+        f"تلاش از طریق سفیر برای دستهٔ {batch_date} تمام شد.\nموفق: {ok}\nناموفق: {failed}",
+    )
+
+
+def handle_callback_query(conn, callback_query):
+    """کلیک روی دکمه‌های منوی ادمین (inline keyboard) را پردازش می‌کند"""
+    cq_id = callback_query.get("id")
+    from_user = callback_query.get("from", {})
+    chat_id = (callback_query.get("message") or {}).get("chat", {}).get("id") or from_user.get("id")
+    data = callback_query.get("data", "")
+
+    if chat_id != ADMIN_CHAT_ID:
+        answer_callback_query(cq_id)
+        return
+
+    if data == "await_phone_list":
+        set_admin_state(conn, chat_id, "awaiting_phone_list")
+        send_message(chat_id, "لطفاً فایل اکسل (یا متنی) لیست شماره مشتریان را بفرستید؛ یک شماره در هر سطر/سلول کافی است.")
+    elif data == "await_price_file":
+        set_admin_state(conn, chat_id, "awaiting_price_file")
+        send_message(chat_id, "لطفاً فایل قیمت و موجودی (اکسل یا متنی) را بفرستید.")
+    elif data == "report_last":
+        send_report(conn, chat_id)
+    elif data == "retry_missing":
+        handle_retry_missing(conn, chat_id)
+    else:
+        log.warning("callback_data ناشناخته: %s", data)
+
+    answer_callback_query(cq_id)
+
+
 def handle_update(conn, update):
+    if "callback_query" in update:
+        handle_callback_query(conn, update["callback_query"])
+        return
+
     message = update.get("message")
     if not message:
         return
@@ -462,15 +814,33 @@ def handle_update(conn, update):
     if chat_id != ADMIN_CHAT_ID:
         return
 
+    if text == "/panel":
+        set_admin_state(conn, chat_id, None)
+        send_message(chat_id, "پنل مدیریت:", reply_markup=ADMIN_MENU_KEYBOARD)
+        return
+
     if text == "/count":
         n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        send_message(chat_id, f"تعداد کاربران ثبت‌شده: {n}")
+        m = len(get_customer_numbers(conn))
+        send_message(chat_id, f"تعداد کاربران استارت‌کرده: {n}\nتعداد شماره در لیست اصلی مشتریان: {m}")
         return
 
     if text == "/queue":
         n = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
         send_message(chat_id, f"تعداد آیتم‌های در صف انتظار ارسال: {n}")
         return
+
+    if text == "گزارش" or text.startswith("گزارش "):
+        parts = text.split(maxsplit=1)
+        day = parts[1].strip() if len(parts) > 1 else None
+        batch_date = find_batch_date_for_day(conn, day) if day else None
+        if day and not batch_date:
+            enqueue(conn, chat_id, f"برای تاریخ «{day}» گزارشی پیدا نشد.")
+            return
+        send_report(conn, chat_id, batch_date)
+        return
+
+    admin_state = get_admin_state(conn, chat_id)
 
     # ---- حالت ۱: ادمین یک فایل فرستاده (txt، csv، xlsx و ...) ----
     if "document" in message:
@@ -481,6 +851,19 @@ def handle_update(conn, update):
         local_path = f"incoming_{safe_id}"
         try:
             download_file(doc["file_id"], local_path)
+
+            if admin_state == "awaiting_phone_list":
+                try:
+                    raw_phones = parse_phone_list_file(local_path, original_filename)
+                except ValueError as e:
+                    enqueue(conn, chat_id, str(e))
+                    return
+                saved = save_customer_numbers(conn, raw_phones)
+                set_admin_state(conn, chat_id, None)
+                enqueue(conn, chat_id, f"✅ لیست شماره مشتریان ذخیره شد. تعداد شماره‌های معتبر: {len(saved)}")
+                return
+
+            # حالت awaiting_price_file یا حالت قدیمی (بدون دکمه) — هر دو یکسان پردازش می‌شوند
             try:
                 rows = parse_price_file(local_path, original_filename)
             except ValueError as e:
@@ -490,15 +873,25 @@ def handle_update(conn, update):
             if caption:
                 phones = [p.strip() for p in re.split(r"[,\n]+", caption) if p.strip()]
             handle_price_rows(conn, chat_id, rows, only_phones=phones)
+            if admin_state == "awaiting_price_file":
+                set_admin_state(conn, chat_id, None)
         finally:
             if os.path.exists(local_path):
                 os.remove(local_path)
         return
 
-    # ---- حالت ۲: ادمین لیست قیمت را مستقیم و خط‌به‌خط تایپ کرده (پیام متنی معمولی) ----
+    # ---- حالت ۲: ادمین شماره‌ها یا لیست قیمت را مستقیم و خط‌به‌خط تایپ کرده ----
     if text.strip():
+        if admin_state == "awaiting_phone_list":
+            raw_phones = re.split(r"[,\n]+", text)
+            saved = save_customer_numbers(conn, raw_phones)
+            set_admin_state(conn, chat_id, None)
+            enqueue(conn, chat_id, f"✅ لیست شماره مشتریان ذخیره شد. تعداد شماره‌های معتبر: {len(saved)}")
+            return
         rows = parse_price_lines(text)
         handle_price_rows(conn, chat_id, rows)
+        if admin_state == "awaiting_price_file":
+            set_admin_state(conn, chat_id, None)
         return
 
 
