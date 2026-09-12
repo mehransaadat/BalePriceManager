@@ -1,1 +1,19 @@
 users.db
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*
+# فایل‌های تولیدشده ربات
+sent_price_lists/
+incoming_*
+users.db
+
+# محیط و اسرار
+.env
+.env.*
+*.xlsx
+*.xls
+
+# پایتون
+__pycache__/
+*.pyc
+.venv/
+venv/

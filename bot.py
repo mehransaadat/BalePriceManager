@@ -11,6 +11,7 @@ import json
 import sqlite3
 import logging
 import datetime
+import zipfile
 import requests
 import jdatetime
 from zoneinfo import ZoneInfo
@@ -127,9 +128,17 @@ def get_admin_state(conn, admin_chat_id):
     return row[0] if row else None
 
 
+_PERSIAN_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
 def normalize_phone(phone: str) -> str:
     """شماره را به فرمت یکسان +98XXXXXXXXXX تبدیل می‌کند"""
-    digits = re.sub(r"\D", "", phone or "")
+    # ارقام فارسی/عربی را به انگلیسی تبدیل می‌کنیم تا \D آن‌ها را حذف نکند
+    text = (phone or "").translate(_PERSIAN_DIGIT_MAP)
+    digits = re.sub(r"\D", "", text)
+    # بعضی فایل‌های اکسل عدد را به صورت 98912... با .0 ذخیره می‌کنند
+    if digits.endswith("0") and len(digits) > 12 and "." in text:
+        digits = re.sub(r"\D", "", text.split(".", 1)[0])
     if digits.startswith("0098"):
         digits = digits[2:]
     if digits.startswith("98") and len(digits) == 12:
@@ -144,15 +153,24 @@ def normalize_phone(phone: str) -> str:
 IRAN_PHONE_RE = re.compile(r"^\+989\d{9}$")
 
 
+def filter_valid_phones(phones):
+    """فقط شماره‌های موبایل ایرانی معتبر را برمی‌گرداند (با نرمال‌سازی)."""
+    valid = []
+    seen = set()
+    for p in phones or []:
+        n = normalize_phone(str(p))
+        if n and IRAN_PHONE_RE.match(n) and n not in seen:
+            seen.add(n)
+            valid.append(n)
+    return valid
+
+
 def save_customer_numbers(conn, phones):
     """لیست کامل شماره مشتریان را جایگزین لیست قبلی می‌کند (چون فایل جدید آپلودشده
     قرار است «لیست به‌روز» باشد، نه اضافه‌شدن به لیست قدیمی). هر چیزی که بعد از
     نرمال‌سازی به شکل یک شمارهٔ موبایل ایرانی معتبر (+98912...) درنیاید، نادیده
     گرفته می‌شود (مثلاً اگر فایل ستون ردیف یا عدد دیگری هم داشته باشد)."""
-    normalized = sorted({
-        normalize_phone(p) for p in phones
-        if IRAN_PHONE_RE.match(normalize_phone(p) or "")
-    })
+    normalized = sorted(filter_valid_phones(phones))
     conn.execute("DELETE FROM customer_numbers")
     conn.executemany(
         "INSERT INTO customer_numbers (phone) VALUES (?)",
@@ -164,7 +182,8 @@ def save_customer_numbers(conn, phones):
 
 def get_customer_numbers(conn):
     rows = conn.execute("SELECT phone FROM customer_numbers ORDER BY phone").fetchall()
-    return [r[0] for r in rows]
+    # فیلتر دوباره برای پاک‌سازی داده‌های قدیمی/نامعتبر احتمالی در دیتابیس
+    return filter_valid_phones([r[0] for r in rows])
 
 
 def save_user(conn, chat_id, phone=None, first_name=None):
@@ -327,6 +346,25 @@ def parse_price_lines(raw_text):
     return rows
 
 
+def _excel_cell_to_str(value):
+    """مقدار سلول اکسل را به رشتهٔ تمیز تبدیل می‌کند (بدون .0 اضافه برای اعداد صحیح)."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value == int(value):
+            return str(int(value))
+        return str(value)
+    text = str(value).strip()
+    # اعدادی که openpyxl گاهی به صورت '1931.0' می‌دهد
+    if re.fullmatch(r"\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
 def parse_price_xlsx(path):
     """فایل اکسل (xlsx/xlsm) را می‌خواند؛ هر سطر باید نام محصول در یک سلول و
     قیمت در آخرین سلول پر شدهٔ همان سطر باشد"""
@@ -335,7 +373,11 @@ def parse_price_xlsx(path):
     rows = []
     first = True
     for excel_row in ws.iter_rows(values_only=True):
-        cells = [str(c).strip() for c in excel_row if c is not None and str(c).strip() != ""]
+        cells = []
+        for c in excel_row:
+            text = _excel_cell_to_str(c)
+            if text != "":
+                cells.append(text)
         if not cells:
             continue
         if first:
@@ -356,50 +398,218 @@ def parse_price_xlsx(path):
     return rows
 
 
-def parse_price_file(local_path, original_filename=""):
-    """بر اساس پسوند فایل ارسالی، روش مناسب تجزیه را انتخاب می‌کند"""
-    ext = os.path.splitext(original_filename or local_path)[1].lower()
+def detect_spreadsheet_kind(local_path, original_filename="", mime_type=""):
+    """نوع واقعی فایل را از روی پسوند، mime-type و بایت‌های ابتدای فایل تشخیص می‌دهد.
+    بعضی کلاینت‌های بله file_name را بدون پسوند می‌فرستند؛ openpyxl هم بدون پسوند
+    .xlsx مسیر را رد می‌کند. بنابراین فقط به پسوند اکتفا نمی‌کنیم."""
+    ext = os.path.splitext(original_filename or "")[1].lower()
+    if not ext:
+        ext = os.path.splitext(local_path or "")[1].lower()
+
+    mime = (mime_type or "").lower()
+    if not ext:
+        if "spreadsheetml" in mime or "xlsx" in mime:
+            ext = ".xlsx"
+        elif "ms-excel" in mime or mime.endswith("xls"):
+            ext = ".xls"
+
+    try:
+        with open(local_path, "rb") as f:
+            header = f.read(8)
+        if header.startswith(b"PK"):
+            if zipfile.is_zipfile(local_path):
+                with zipfile.ZipFile(local_path) as zf:
+                    if any(name.startswith("xl/") for name in zf.namelist()):
+                        return "xlsx"
+            return "xlsx"
+        if header.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+            return "xls"
+    except OSError:
+        pass
+
     if ext in (".xlsx", ".xlsm"):
-        return parse_price_xlsx(local_path)
+        return "xlsx"
     if ext == ".xls":
+        return "xls"
+    return "text"
+
+
+def ensure_spreadsheet_extension(local_path, kind):
+    """openpyxl مسیر بدون پسوند .xlsx/.xlsm را نمی‌پذیرد؛ در صورت نیاز فایل را
+    با پسوند درست کپی می‌کند و مسیر جدید را برمی‌گرداند."""
+    ext = os.path.splitext(local_path)[1].lower()
+    if kind == "xlsx" and ext not in (".xlsx", ".xlsm"):
+        new_path = local_path + ".xlsx"
+        if not os.path.exists(new_path):
+            with open(local_path, "rb") as src, open(new_path, "wb") as dst:
+                dst.write(src.read())
+        return new_path
+    if kind == "xls" and ext != ".xls":
+        new_path = local_path + ".xls"
+        if not os.path.exists(new_path):
+            with open(local_path, "rb") as src, open(new_path, "wb") as dst:
+                dst.write(src.read())
+        return new_path
+    return local_path
+
+
+def _load_xls_sheet_rows(path):
+    """خواندن فایل قدیمی .xls با xlrd (در صورت نصب بودن)"""
+    try:
+        import xlrd
+    except ImportError as e:
         raise ValueError(
-            "فرمت قدیمی xls پشتیبانی نمی‌شود. لطفاً فایل را با فرمت xlsx ذخیره کنید "
-            "یا آن را به‌صورت فایل متنی (txt / csv) بفرستید."
-        )
-    # هر فایل دیگری (txt، csv، tsv، بدون پسوند و ...) به‌عنوان متن ساده خوانده می‌شود
-    raw_text = read_text_any_encoding(local_path)
-    return parse_price_lines(raw_text)
+            "این فایل فرمت قدیمی .xls است. یا آن را در اکسل با Save As به صورت "
+            ".xlsx ذخیره کنید، یا روی سرور دستور pip install xlrd را بزنید."
+        ) from e
+    book = xlrd.open_workbook(path)
+    return book.sheet_by_index(0)
 
 
-def parse_phone_list_file(local_path, original_filename=""):
+def parse_price_xls(path):
+    sheet = _load_xls_sheet_rows(path)
+    rows = []
+    first = True
+    for r in range(sheet.nrows):
+        cells = []
+        for c in range(sheet.ncols):
+            val = sheet.cell_value(r, c)
+            if val is None or val == "":
+                continue
+            if isinstance(val, float) and val == int(val):
+                val = int(val)
+            text = str(val).strip()
+            if text:
+                cells.append(text)
+        if not cells:
+            continue
+        if first:
+            first = False
+            if _looks_like_header(cells):
+                continue
+        if len(cells) >= 3 and re.fullmatch(r"\d+", cells[0]):
+            cells = cells[1:]
+        if len(cells) >= 2:
+            name = " ".join(cells[:-1])
+            price = cells[-1]
+        else:
+            name, price = cells[0], ""
+        rows.append((name, price))
+    return rows
+
+
+def parse_phone_list_xls(path):
+    sheet = _load_xls_sheet_rows(path)
+    phones = []
+    for r in range(sheet.nrows):
+        for c in range(sheet.ncols):
+            val = sheet.cell_value(r, c)
+            if val is None or val == "":
+                continue
+            if isinstance(val, float) and val == int(val):
+                val = int(val)
+            text = str(val).strip()
+            if not text or _looks_like_header([text]):
+                continue
+            phones.append(text)
+    return phones
+
+
+def parse_price_file(local_path, original_filename="", mime_type=""):
+    """بر اساس پسوند/محتوای فایل ارسالی، روش مناسب تجزیه را انتخاب می‌کند"""
+    kind = detect_spreadsheet_kind(local_path, original_filename, mime_type)
+    if kind == "text":
+        raw_text = read_text_any_encoding(local_path)
+        return parse_price_lines(raw_text)
+
+    path = ensure_spreadsheet_extension(local_path, kind)
+    tmp_copy = path if path != local_path else None
+    try:
+        try:
+            if kind == "xlsx":
+                return parse_price_xlsx(path)
+            if kind == "xls":
+                return parse_price_xls(path)
+        except ValueError:
+            raise
+        except Exception as e:
+            msg = str(e).lower()
+            if "xls" in msg or "not support" in msg:
+                try:
+                    xls_path = ensure_spreadsheet_extension(local_path, "xls")
+                    try:
+                        return parse_price_xls(xls_path)
+                    finally:
+                        if xls_path != local_path and xls_path != path and os.path.exists(xls_path):
+                            os.remove(xls_path)
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
+            raise ValueError(
+                f"نتوانستم فایل اکسل را بخوانم: {e}\n"
+                "لطفاً فایل را با فرمت .xlsx ذخیره کنید و دوباره بفرستید."
+            ) from e
+    finally:
+        if tmp_copy and os.path.exists(tmp_copy):
+            os.remove(tmp_copy)
+    return []
+
+
+def parse_phone_list_file(local_path, original_filename="", mime_type=""):
     """فایل لیست شماره مشتریان (اکسل یا متنی) را می‌خواند و یک لیست ساده از رشته‌های
     خام شماره برمی‌گرداند (نرمال‌سازی نهایی توسط normalize_phone در save_customer_numbers
     انجام می‌شود، پس اینجا لازم نیست فرمت خاصی رعایت شود)"""
-    ext = os.path.splitext(original_filename or local_path)[1].lower()
+    kind = detect_spreadsheet_kind(local_path, original_filename, mime_type)
     phones = []
-    if ext in (".xlsx", ".xlsm"):
-        wb = load_workbook(local_path, data_only=True)
-        ws = wb.active
-        for excel_row in ws.iter_rows(values_only=True):
-            for cell in excel_row:
-                if cell is None:
-                    continue
-                text = str(cell).strip()
-                if not text or _looks_like_header([text]):
-                    continue
-                phones.append(text)
-    elif ext == ".xls":
-        raise ValueError(
-            "فرمت قدیمی xls پشتیبانی نمی‌شود. لطفاً فایل را با فرمت xlsx ذخیره کنید "
-            "یا آن را به‌صورت فایل متنی (txt / csv) بفرستید."
-        )
-    else:
+    if kind == "text":
         raw_text = read_text_any_encoding(local_path)
         for line in raw_text.splitlines():
             for part in re.split(r"[,\t;]+|\s{2,}", line.strip()):
                 part = part.strip()
                 if part:
                     phones.append(part)
+        return phones
+
+    path = ensure_spreadsheet_extension(local_path, kind)
+    tmp_copy = path if path != local_path else None
+    try:
+        try:
+            if kind == "xlsx":
+                wb = load_workbook(path, data_only=True)
+                ws = wb.active
+                for excel_row in ws.iter_rows(values_only=True):
+                    for cell in excel_row:
+                        text = _excel_cell_to_str(cell)
+                        if not text or _looks_like_header([text]):
+                            continue
+                        phones.append(text)
+                return phones
+            if kind == "xls":
+                return parse_phone_list_xls(path)
+        except ValueError:
+            raise
+        except Exception as e:
+            msg = str(e).lower()
+            if "xls" in msg or "not support" in msg:
+                try:
+                    xls_path = ensure_spreadsheet_extension(local_path, "xls")
+                    try:
+                        return parse_phone_list_xls(xls_path)
+                    finally:
+                        if xls_path != local_path and xls_path != path and os.path.exists(xls_path):
+                            os.remove(xls_path)
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
+            raise ValueError(
+                f"نتوانستم فایل اکسل شماره‌ها را بخوانم: {e}\n"
+                "لطفاً فایل را با فرمت .xlsx ذخیره کنید و دوباره بفرستید."
+            ) from e
+    finally:
+        if tmp_copy and os.path.exists(tmp_copy):
+            os.remove(tmp_copy)
     return phones
 
 
@@ -524,9 +734,18 @@ def broadcast(conn, text="", file_path=None, only_phones=None, parse_mode=None):
     all_users = conn.execute("SELECT chat_id, phone FROM users").fetchall()
 
     if only_phones:
-        wanted = {normalize_phone(p) for p in only_phones}
-        targets = [(cid, ph) for cid, ph in all_users if ph in wanted]
-        matched = {ph for _, ph in targets}
+        # فقط شماره‌های معتبر؛ و مقایسه با نسخهٔ نرمال‌شدهٔ شمارهٔ ذخیره‌شده در users
+        wanted = set(filter_valid_phones(only_phones))
+        targets = []
+        matched = set()
+        for cid, ph in all_users:
+            norm = normalize_phone(ph) if ph else ""
+            if norm and norm in wanted:
+                targets.append((cid, norm))
+                matched.add(norm)
+            elif ph in wanted:
+                targets.append((cid, ph))
+                matched.add(ph)
         missing = wanted - matched
     else:
         targets = all_users
@@ -646,7 +865,15 @@ def handle_price_rows(conn, admin_chat_id, rows, only_phones=None):
     out_path = build_price_file(rows, jnow)
     caption = price_list_caption(jnow)
 
-    # اگر ادمین لیست شماره خاصی در caption نداده باشد و لیست اصلی مشتریان (از دکمهٔ
+    # اگر از caption یا جای دیگر لیست شماره آمده، فقط شماره‌های موبایل معتبر را نگه دار.
+    # مقادیر نامعتبر مثل کد کالا / قیمت / تاریخ (مثلاً 14050611 یا 1931) نباید
+    # باعث شوند ارسال به هیچ‌کس نرسد.
+    if only_phones is not None:
+        only_phones = filter_valid_phones(only_phones)
+        if not only_phones:
+            only_phones = None
+
+    # اگر ادمین لیست شماره خاصی نداده باشد و لیست اصلی مشتریان (از دکمهٔ
     # «آپلود لیست شماره مشتریان») پر باشد، هدف پیش‌فرض همان لیست است؛ در غیر این
     # صورت رفتار قبلی حفظ می‌شود (همهٔ کاربران ثبت‌شده در ربات)
     if only_phones is None:
@@ -846,15 +1073,23 @@ def handle_update(conn, update):
     if "document" in message:
         doc = message["document"]
         caption = (message.get("caption") or "").strip()
-        original_filename = doc.get("file_name", "")
-        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", doc["file_id"])
-        local_path = f"incoming_{safe_id}"
+        original_filename = doc.get("file_name") or ""
+        mime_type = doc.get("mime_type") or ""
+        name_ext = os.path.splitext(original_filename)[1].lower()
+        if not name_ext:
+            mt = mime_type.lower()
+            if "spreadsheetml" in mt or "xlsx" in mt:
+                name_ext = ".xlsx"
+            elif "ms-excel" in mt or mt.endswith("xls"):
+                name_ext = ".xls"
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(doc["file_id"]))
+        local_path = f"incoming_{safe_id}{name_ext}"
         try:
             download_file(doc["file_id"], local_path)
 
             if admin_state == "awaiting_phone_list":
                 try:
-                    raw_phones = parse_phone_list_file(local_path, original_filename)
+                    raw_phones = parse_phone_list_file(local_path, original_filename, mime_type)
                 except ValueError as e:
                     enqueue(conn, chat_id, str(e))
                     return
@@ -865,19 +1100,28 @@ def handle_update(conn, update):
 
             # حالت awaiting_price_file یا حالت قدیمی (بدون دکمه) — هر دو یکسان پردازش می‌شوند
             try:
-                rows = parse_price_file(local_path, original_filename)
+                rows = parse_price_file(local_path, original_filename, mime_type)
             except ValueError as e:
                 enqueue(conn, chat_id, str(e))
                 return
             phones = None
             if caption:
-                phones = [p.strip() for p in re.split(r"[,\n]+", caption) if p.strip()]
+                # caption فقط وقتی به‌عنوان فیلتر گیرنده استفاده می‌شود که
+                # واقعاً شماره موبایل معتبر داخلش باشد؛ وگرنه نادیده گرفته می‌شود
+                # تا کد کالا/قیمت اشتباهاً جای شماره ننشیند.
+                candidates = [p.strip() for p in re.split(r"[,\n]+", caption) if p.strip()]
+                phones = filter_valid_phones(candidates) or None
             handle_price_rows(conn, chat_id, rows, only_phones=phones)
             if admin_state == "awaiting_price_file":
                 set_admin_state(conn, chat_id, None)
         finally:
             if os.path.exists(local_path):
                 os.remove(local_path)
+            # اگر به‌خاطر نبود پسوند، کپی .xlsx/.xls ساخته شده بود آن را هم پاک کن
+            for extra_ext in (".xlsx", ".xls"):
+                extra = local_path + extra_ext
+                if extra != local_path and os.path.exists(extra):
+                    os.remove(extra)
         return
 
     # ---- حالت ۲: ادمین شماره‌ها یا لیست قیمت را مستقیم و خط‌به‌خط تایپ کرده ----
