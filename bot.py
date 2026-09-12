@@ -18,8 +18,8 @@ from zoneinfo import ZoneInfo
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 
-BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "1258122671:KfFt7JNbCDAE2gIvgNSBWPcMT-i-kinpZAg")
-ADMIN_CHAT_ID = int(os.environ.get("BALE_ADMIN_CHAT_ID", "1804507729"))
+BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN", "your-bot-token")
+ADMIN_CHAT_ID = int(os.environ.get("BALE_ADMIN_CHAT_ID", "your-chat-id"))
 
 API_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 FILE_URL = f"https://tapi.bale.ai/file/bot{BOT_TOKEN}"
